@@ -15,9 +15,12 @@
 package ip
 
 import (
-	"crypto/rand"
+	crand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
+	mrand "math/rand"
 	"net"
 	"os"
 
@@ -33,7 +36,14 @@ var (
 	ErrLinkNotFound = errors.New("link not found")
 )
 
+func log(format string, a ...interface{}) {
+	logFile, _ := os.OpenFile("/tmp/cni.log", os.O_APPEND|os.O_WRONLY, 0600)
+	_, _ = fmt.Fprintf(logFile, format + "\n", a...)
+	logFile.Close()
+}
+
 func makeVethPair(name, peer string, mtu int) (netlink.Link, error) {
+	log(">>>> makeVethPair for (%s, %s)", name, peer)
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
 			Name:  name,
@@ -49,28 +59,35 @@ func makeVethPair(name, peer string, mtu int) (netlink.Link, error) {
 	veth2, err := netlink.LinkByName(name)
 	if err != nil {
 		netlink.LinkDel(veth) // try and clean up the link if possible.
+		log(">>>> LinkByName error : %q", err)
 		return nil, err
 	}
-
+	log(">>>> Done with %q", veth2)
 	return veth2, nil
 }
 
 func peerExists(name string) bool {
+	log(">>>> peerExists for %s", name)
 	if _, err := netlink.LinkByName(name); err != nil {
+		log(">>>> peerExists false : %q", err)
 		return false
 	}
+	log(">>>> peerExists true")
 	return true
 }
 
 func makeVeth(name, vethPeerName string, mtu int) (peerName string, veth netlink.Link, err error) {
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 100; i++ {
 		if vethPeerName != "" {
 			peerName = vethPeerName
+			log(">>>> peerName : %s", peerName)
 		} else {
 			peerName, err = RandomVethName()
 			if err != nil {
+				log(">>>> RandomVethName error : %q", err)
 				return
 			}
+			log(">>>> RandomVethName : %s", peerName)
 		}
 
 		veth, err = makeVethPair(name, peerName, mtu)
@@ -79,10 +96,15 @@ func makeVeth(name, vethPeerName string, mtu int) (peerName string, veth netlink
 			return
 
 		case os.IsExist(err):
-			if peerExists(peerName) && vethPeerName == "" {
+			log(">>>> IsExist (%s, %s, %s): %q", name, peerName, vethPeerName, err)
+			if vethPeerName == "" {
+				log(">>>> trying again on vethPeerName ...")
 				continue
 			}
-			err = fmt.Errorf("container veth name provided (%v) already exists", name)
+			if !peerExists(vethPeerName) {
+				log(">>>> container veth name provided (%v, %v) already exists", name, vethPeerName)
+				err = fmt.Errorf("container veth name provided (%v, %v) already exists", name, vethPeerName)
+			}
 			return
 
 		default:
@@ -96,16 +118,19 @@ func makeVeth(name, vethPeerName string, mtu int) (peerName string, veth netlink
 	return
 }
 
+func NewCryptoSeededSource() mrand.Source {
+	var seed int64
+	binary.Read(crand.Reader, binary.BigEndian, &seed)
+	return mrand.NewSource(seed)
+}
+
+var random = mrand.New(NewCryptoSeededSource())
+
 // RandomVethName returns string "veth" with random prefix (hashed from entropy)
 func RandomVethName() (string, error) {
-	entropy := make([]byte, 4)
-	_, err := rand.Reader.Read(entropy)
-	if err != nil {
-		return "", fmt.Errorf("failed to generate random veth name: %v", err)
-	}
-
 	// NetworkManager (recent versions) will ignore veth devices that start with "veth"
-	return fmt.Sprintf("veth%x", entropy), nil
+	rand := random.Int31n(math.MaxInt32) + int32(os.Getpid())
+	return fmt.Sprintf("veth%x", rand), nil
 }
 
 func RenameLink(curName, newName string) error {
